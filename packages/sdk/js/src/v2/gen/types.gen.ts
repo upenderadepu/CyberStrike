@@ -243,6 +243,8 @@ export type AssistantMessage = {
   variant?: string
   finish?: string
   stepCapped?: boolean
+  stuckNudged?: boolean
+  stuckAborted?: boolean
 }
 
 export type Message = UserMessage | AssistantMessage
@@ -842,6 +844,7 @@ export type Vulnerability = {
   endpoint?: string
   attack_vector?: string
   status?: "new" | "approved" | "duplicate" | "open" | "fixed" | "ignored"
+  candidate?: "critical" | "high" | "medium" | "low" | "info"
   duplicate_of?: string
   message_id?: string
   time?: {
@@ -1372,6 +1375,46 @@ export type KeybindsConfig = {
    */
   session_unshare?: string
   /**
+   * Pin/unpin session to quick switch slot
+   */
+  session_pin_toggle?: string
+  /**
+   * Quick switch to pinned session slot 1
+   */
+  session_quick_switch_1?: string
+  /**
+   * Quick switch to pinned session slot 2
+   */
+  session_quick_switch_2?: string
+  /**
+   * Quick switch to pinned session slot 3
+   */
+  session_quick_switch_3?: string
+  /**
+   * Quick switch to pinned session slot 4
+   */
+  session_quick_switch_4?: string
+  /**
+   * Quick switch to pinned session slot 5
+   */
+  session_quick_switch_5?: string
+  /**
+   * Quick switch to pinned session slot 6
+   */
+  session_quick_switch_6?: string
+  /**
+   * Quick switch to pinned session slot 7
+   */
+  session_quick_switch_7?: string
+  /**
+   * Quick switch to pinned session slot 8
+   */
+  session_quick_switch_8?: string
+  /**
+   * Quick switch to pinned session slot 9
+   */
+  session_quick_switch_9?: string
+  /**
    * Interrupt current session
    */
   session_interrupt?: string
@@ -1774,31 +1817,7 @@ export type AgentConfig = {
    */
   maxSteps?: number
   permission?: PermissionConfig
-  [key: string]:
-    | unknown
-    | string
-    | number
-    | {
-        [key: string]: boolean
-      }
-    | boolean
-    | "subagent"
-    | "primary"
-    | "all"
-    | {
-        [key: string]: unknown
-      }
-    | string
-    | "primary"
-    | "secondary"
-    | "accent"
-    | "success"
-    | "warning"
-    | "error"
-    | "info"
-    | number
-    | PermissionConfig
-    | undefined
+  [key: string]: unknown
 }
 
 export type ProviderConfig = {
@@ -1899,7 +1918,7 @@ export type ProviderConfig = {
            * Disable this variant for the model
            */
           disabled?: boolean
-          [key: string]: unknown | boolean | undefined
+          [key: string]: unknown
         }
       }
     }
@@ -1921,7 +1940,7 @@ export type ProviderConfig = {
      * Timeout in milliseconds for requests to this provider. Default is 300000 (5 minutes). Set to false to disable timeout.
      */
     timeout?: number | false
-    [key: string]: unknown | string | boolean | number | false | undefined
+    [key: string]: unknown
   }
 }
 
@@ -2083,7 +2102,7 @@ export type Config = {
   plugin?: Array<string>
   snapshot?: boolean
   /**
-   * Control sharing behavior:'manual' allows manual sharing via commands, 'auto' enables automatic sharing, 'disabled' disables all sharing
+   * Control sharing behavior: 'disabled' disables all sharing (default), 'manual' allows manual sharing via commands, 'auto' enables automatic sharing. Requires enterprise URL configuration.
    */
   share?: "manual" | "auto" | "disabled"
   /**

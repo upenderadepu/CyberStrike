@@ -39,9 +39,13 @@ import { WebWriteFunctionTool } from "./web-write-function"
 import { WebGetSessionContextTool } from "./web-get-session-context"
 import { WebGetDetailTool } from "./web-get-detail"
 import { WebGetRequestDetailTool } from "./web-get-request-detail"
+import { InjectProbeTool } from "./inject-probe"
+import { HttpReplayTool, HttpReplayRawTool } from "./http-replay"
 import { WebGetVulnerabilitiesTool } from "./web-get-vulnerabilities"
 import { WebGetVulnDetailTool } from "./web-get-vuln-detail"
 import { WebUpdateCredentialClaimsTool } from "./web-update-credential-claims"
+import { WebUpdateCredentialTool } from "./web-update-credential"
+import { CsrfExtractTool } from "./csrf-extract"
 import { HackbrowserTool } from "./hackbrowser"
 import { AddIntelTool } from "./intel"
 import { UpdateVrtCheckTool } from "./vrt-check"
@@ -54,9 +58,17 @@ import { GenerateReportTool } from "./generate-report"
 import { EbpfTool } from "./ebpf"
 import { WinhookTool } from "./winhook"
 import { MachookTool } from "./machook"
+import { LinuxhookTool } from "./linuxhook"
 import { AwshookTool } from "./awshook"
 import { AzurehookTool } from "./azurehook"
 import { KubehookTool } from "./kubehook"
+import { GcphookTool } from "./gcphook"
+import { ContainerhookTool } from "./containerhook"
+import { IachookTool } from "./iachook"
+import { LlmhookTool } from "./llmhook"
+import { CloudAuditTool } from "./cloud-audit"
+import { K8sAuditTool } from "./k8s-audit"
+import { CiAuditTool } from "./ci-audit"
 import { CipipeTool } from "./cipipe"
 
 export namespace ToolRegistry {
@@ -167,9 +179,14 @@ export namespace ToolRegistry {
       WebGetSessionContextTool,
       WebGetDetailTool,
       WebGetRequestDetailTool,
+      InjectProbeTool,
+      HttpReplayTool,
+      HttpReplayRawTool,
       WebGetVulnerabilitiesTool,
       WebGetVulnDetailTool,
       WebUpdateCredentialClaimsTool,
+      WebUpdateCredentialTool,
+      CsrfExtractTool,
       // Hackbrowser — autonomous crawler that produces captures the
       // proxy-analyzer ingests. Upstream of the rest of the web pipeline.
       HackbrowserTool,
@@ -186,9 +203,17 @@ export namespace ToolRegistry {
       EbpfTool,
       WinhookTool,
       MachookTool,
+      LinuxhookTool,
       AwshookTool,
       AzurehookTool,
       KubehookTool,
+      GcphookTool,
+      ContainerhookTool,
+      IachookTool,
+      LlmhookTool,
+      CloudAuditTool,
+      K8sAuditTool,
+      CiAuditTool,
       CipipeTool,
       ...custom,
     ]

@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: "Bump major, minor, patch, or beta"
+        description: "Bump major, minor, patch, beta, or canary"
         required: false
         type: choice
         options:
@@ -13,10 +13,21 @@ on:
           - minor
           - patch
           - beta
+          - canary
       version:
         description: "Override version (optional)"
         required: false
         type: string
+      platform:
+        description: "Build only this OS (all = every platform)"
+        required: false
+        type: choice
+        default: all
+        options:
+          - all
+          - windows
+          - linux
+          - darwin
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.version || inputs.bump }}
@@ -92,6 +103,7 @@ jobs:
         env:
           CYBERSTRIKE_VERSION: ${{ needs.version.outputs.version }}
           CYBERSTRIKE_RELEASE: ${{ needs.version.outputs.release }}
+          CYBERSTRIKE_BUILD_OS: ${{ inputs.platform }}
           GH_TOKEN: ${{ github.token }}
 
       - uses: actions/upload-artifact@v4

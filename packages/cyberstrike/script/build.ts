@@ -46,7 +46,7 @@ const migrations = await Promise.all(
           Number(match[6]),
         )
       : 0
-    return { sql, timestamp }
+    return { sql, timestamp, name }
   }),
 )
 console.log(`Loaded ${migrations.length} migrations`)
@@ -114,7 +114,10 @@ const allTargets: {
   },
 ]
 
-const targets = singleFlag
+// CI-only: build just one OS when set (windows/linux/darwin). Empty or "all" = every platform.
+const buildOSRaw = process.env.CYBERSTRIKE_BUILD_OS?.trim()
+const buildOS = buildOSRaw && buildOSRaw !== "all" ? buildOSRaw : undefined
+const targets = (singleFlag
   ? allTargets.filter((item) => {
       if (item.os !== process.platform || item.arch !== process.arch) {
         return false
@@ -134,6 +137,11 @@ const targets = singleFlag
       return true
     })
   : allTargets
+).filter((item) => {
+  if (!buildOS) return true
+  const os = item.os === "win32" ? "windows" : item.os
+  return os === buildOS
+})
 
 await $`rm -rf dist`
 

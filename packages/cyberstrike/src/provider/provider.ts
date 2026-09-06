@@ -245,7 +245,14 @@ export namespace Provider {
         process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI || process.env.AWS_CONTAINER_CREDENTIALS_FULL_URI,
       )
 
-      if (!profile && !awsAccessKeyId && !awsBearerToken && !awsWebIdentityTokenFile && !containerCreds)
+      if (
+        !profile &&
+        !awsAccessKeyId &&
+        !awsBearerToken &&
+        !awsWebIdentityTokenFile &&
+        !containerCreds &&
+        !providerConfig
+      )
         return { autoload: false }
 
       const providerOptions: AmazonBedrockProviderSettings = {
@@ -255,12 +262,15 @@ export namespace Provider {
       // Only use credential chain if no bearer token exists
       // Bearer token takes precedence over credential chain (profiles, access keys, IAM roles, web identity tokens)
       if (!awsBearerToken) {
-        const { fromNodeProviderChain } = await import(await BunProc.install("@aws-sdk/credential-providers"))
-
-        // Build credential provider options (only pass profile if specified)
         const credentialProviderOptions = profile ? { profile } : {}
-
-        providerOptions.credentialProvider = fromNodeProviderChain(credentialProviderOptions)
+        try {
+          const { fromNodeProviderChain } = await import(await BunProc.install("@aws-sdk/credential-providers"))
+          providerOptions.credentialProvider = fromNodeProviderChain(credentialProviderOptions)
+        } catch {
+          log.warn("fromNodeProviderChain failed, falling back to IMDS")
+          const { fromInstanceMetadata } = await import(await BunProc.install("@aws-sdk/credential-provider-imds"))
+          providerOptions.credentialProvider = fromInstanceMetadata()
+        }
       }
 
       // Add custom endpoint if specified (endpoint takes precedence over baseURL)
@@ -382,14 +392,22 @@ export namespace Provider {
       }
     },
     "google-vertex": async () => {
-      const project = Env.get("GOOGLE_CLOUD_PROJECT") ?? Env.get("GCP_PROJECT") ?? Env.get("GCLOUD_PROJECT")
-      const location = Env.get("GOOGLE_CLOUD_LOCATION") ?? Env.get("VERTEX_LOCATION") ?? "us-east5"
-      const autoload = Boolean(project)
-      if (!autoload) return { autoload: false }
+      const project =
+        Env.get("GOOGLE_CLOUD_PROJECT") ??
+        Env.get("GCP_PROJECT") ??
+        Env.get("GCLOUD_PROJECT") ??
+        Env.get("GOOGLE_VERTEX_PROJECT")
+      const location =
+        Env.get("GOOGLE_CLOUD_LOCATION") ??
+        Env.get("VERTEX_LOCATION") ??
+        Env.get("GOOGLE_VERTEX_LOCATION") ??
+        "us-east5"
+      const hasCredentials = Boolean(Env.get("GOOGLE_APPLICATION_CREDENTIALS"))
+      if (!project && !hasCredentials) return { autoload: false }
       return {
         autoload: true,
         options: {
-          project,
+          ...(project && { project }),
           location,
         },
         async getModel(sdk: any, modelID: string) {
@@ -399,10 +417,15 @@ export namespace Provider {
       }
     },
     "google-vertex-anthropic": async () => {
-      const project = Env.get("GOOGLE_CLOUD_PROJECT") ?? Env.get("GCP_PROJECT") ?? Env.get("GCLOUD_PROJECT")
-      const location = Env.get("GOOGLE_CLOUD_LOCATION") ?? Env.get("VERTEX_LOCATION") ?? "global"
-      const autoload = Boolean(project)
-      if (!autoload) return { autoload: false }
+      const project =
+        Env.get("GOOGLE_CLOUD_PROJECT") ??
+        Env.get("GCP_PROJECT") ??
+        Env.get("GCLOUD_PROJECT") ??
+        Env.get("GOOGLE_VERTEX_PROJECT")
+      const location =
+        Env.get("GOOGLE_CLOUD_LOCATION") ?? Env.get("VERTEX_LOCATION") ?? Env.get("GOOGLE_VERTEX_LOCATION") ?? "global"
+      const hasCredentials = Boolean(Env.get("GOOGLE_APPLICATION_CREDENTIALS"))
+      if (!project && !hasCredentials) return { autoload: false }
       // Continental multi-regions (eu, us) require Regional Endpoint Platform domains
       const baseURL =
         project && (location === "eu" || location === "us")
@@ -411,7 +434,7 @@ export namespace Provider {
       return {
         autoload: true,
         options: {
-          project,
+          ...(project && { project }),
           location,
           ...(baseURL && { baseURL }),
         },
@@ -1012,7 +1035,7 @@ export namespace Provider {
         if (modelID === "gpt-5-chat-latest" || (providerID === "openrouter" && modelID === "openai/gpt-5-chat"))
           delete provider.models[modelID]
         if (model.status === "alpha" && !Flag.CYBERSTRIKE_ENABLE_EXPERIMENTAL_MODELS) delete provider.models[modelID]
-        if (model.status === "deprecated") delete provider.models[modelID]
+        // deprecated models are kept visible/selectable (no longer filtered out)
         if (
           (configProvider?.blacklist && configProvider.blacklist.includes(modelID)) ||
           (configProvider?.whitelist && !configProvider.whitelist.includes(modelID))
@@ -1224,6 +1247,7 @@ export namespace Provider {
     anthropicUserId?: string
     anthropicSystemPrefix?: string
     copilotToken?: string
+    copilotEnterpriseDomain?: string
   }> {
     const s = await state()
     const provider = s.providers[model.providerID]
@@ -1273,13 +1297,15 @@ export namespace Provider {
       if (auth?.type === "oauth" && auth.refresh) {
         // Enterprise deployments route through copilot-api.{domain}
         let baseURL = options["baseURL"] as string | undefined
+        let enterpriseDomain: string | undefined
         if (auth.enterpriseUrl) {
-          const domain = auth.enterpriseUrl.replace(/^https?:\/\//, "").replace(/\/$/, "")
-          baseURL = `https://copilot-api.${domain}`
+          enterpriseDomain = auth.enterpriseUrl.replace(/^https?:\/\//, "").replace(/\/$/, "")
+          baseURL = `https://copilot-api.${enterpriseDomain}`
         }
         return {
           npm: model.api.npm,
           copilotToken: auth.refresh,
+          copilotEnterpriseDomain: enterpriseDomain,
           baseURL,
           modelApiId: model.api.id,
           headers: mergedHeaders,
@@ -1320,6 +1346,15 @@ export namespace Provider {
       const parsed = parseModel(cfg.small_model)
       return getModel(parsed.providerID, parsed.modelID)
     }
+
+    // GitHub Copilot's model catalog is static (models.dev), not the user's live
+    // entitlements — a hardcoded small model like gpt-5-mini may not be enabled
+    // on their plan (common on GitHub Enterprise), so the background summarize/
+    // title task loops on "the model is not supported". With no small_model
+    // configured, defer to the caller's main model (which the user is already
+    // using, hence entitled). Copilot is subscription-billed, so a separate
+    // small model saves nothing here anyway.
+    if (providerID.startsWith("github-copilot")) return undefined
 
     const provider = await state().then((state) => state.providers[providerID])
     if (provider) {

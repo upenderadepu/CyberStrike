@@ -20,6 +20,8 @@ import PROMPT_MOBILE_APPLICATION from "./prompt/mobile-application.txt"
 import PROMPT_NORMALIZE_REQUEST from "./prompt/normalize-request.txt"
 import PROMPT_CYBERSTRIKE from "./prompt/cyberstrike.txt"
 import PROMPT_GENERAL from "./prompt/general.txt"
+import PROMPT_PROXY_TESTER_LLM from "./prompt/vuln/llm/prompt.txt"
+import DESC_PROXY_TESTER_LLM from "./prompt/vuln/llm/description.txt"
 
 // New folder-based agent imports
 import PROMPT_VULN_COMMON from "./prompt/vuln/common-prompt.txt"
@@ -55,12 +57,12 @@ import { Plugin } from "@/plugin"
 import { Skill } from "../skill"
 
 // ============================================================================
-// Static skill injection for vulnerability testing sub-agents
+// Skill injection for vulnerability testing sub-agents
 //
-// Vuln tester sub-agents do not have access to the `skill` tool (their
-// permission is `*: deny` with a small allowlist). To give them the
-// methodology they need without runtime tool calls, we statically embed
-// WSTG skill content via `Skill.get()` into each agent's prompt at startup.
+// Two layers: (1) static WSTG skills embedded at startup via loadVulnAgent()
+// as baseline methodology, and (2) dynamic skill tool access at runtime so
+// agents can discover tech-specific or CWE-specific skills when they detect
+// the target's stack or need deeper methodology.
 // ============================================================================
 
 // Strip defensive sections (Remediation, Risk Assessment, CWE Categories,
@@ -116,6 +118,14 @@ async function loadVulnAgent(
 }
 
 export namespace Agent {
+  // Hard step-caps (Layer 1 backstop for the loop-termination fix — see
+  // AGENT_LOOP_TERMINATION_SPEC.md). Single tuning point. NOTE: proxy-tester-* are
+  // deliberately left at their existing default of 50 (see the `startsWith` guard
+  // below — lowering them regressed findings); only the two genuinely-uncapped
+  // orchestration agents get a cap here. Enforcement (tool-strip + break on the
+  // capped turn) lives in session/prompt.ts.
+  const STEP_CAPS = { orchestrator: 40, analyzer: 20 } as const
+
   export const Info = z
     .object({
       name: z.string(),
@@ -309,7 +319,7 @@ export namespace Agent {
           PermissionNext.fromConfig({
             question: "allow",
             bash: "allow",
-            browser: "allow",
+            hackbrowser: "allow",
             read: "allow",
             glob: "allow",
             grep: "allow",
@@ -341,7 +351,7 @@ export namespace Agent {
           PermissionNext.fromConfig({
             question: "allow",
             bash: "allow",
-            browser: "allow",
+            hackbrowser: "allow",
             read: "allow",
             glob: "allow",
             grep: "allow",
@@ -375,13 +385,17 @@ export namespace Agent {
           "aws-postexploit",
           "azure-postexploit",
           "k8s-postexploit",
+          "gcp-postexploit",
+          "cloud-assessment",
+          "k8s-assessment",
+          "ci-assessment",
         ],
         permission: PermissionNext.merge(
           defaults,
           PermissionNext.fromConfig({
             question: "allow",
             bash: "allow",
-            browser: "allow",
+            hackbrowser: "allow",
             read: "allow",
             glob: "allow",
             grep: "allow",
@@ -396,6 +410,12 @@ export namespace Agent {
             awshook: "allow",
             azurehook: "allow",
             kubehook: "allow",
+            gcphook: "allow",
+            containerhook: "allow",
+            iachook: "allow",
+            cloud_audit: "allow",
+            k8s_audit: "allow",
+            ci_audit: "allow",
           }),
           user,
         ),
@@ -413,10 +433,12 @@ export namespace Agent {
           "kerberos-attacks",
           "ebpf-attacks",
           "windows-postexploit",
+          "linux-postexploit",
           "macos-postexploit",
           "aws-postexploit",
           "azure-postexploit",
           "k8s-postexploit",
+          "gcp-postexploit",
           "cicd-attacks",
         ],
         permission: PermissionNext.merge(
@@ -424,7 +446,7 @@ export namespace Agent {
           PermissionNext.fromConfig({
             question: "allow",
             bash: "allow",
-            browser: "allow",
+            hackbrowser: "allow",
             read: "allow",
             glob: "allow",
             grep: "allow",
@@ -439,9 +461,16 @@ export namespace Agent {
             ebpf: "allow",
             winhook: "allow",
             machook: "allow",
+            linuxhook: "allow",
             awshook: "allow",
             azurehook: "allow",
             kubehook: "allow",
+            gcphook: "allow",
+            containerhook: "allow",
+            iachook: "allow",
+            cloud_audit: "allow",
+            k8s_audit: "allow",
+            ci_audit: "allow",
             cipipe: "allow",
           }),
           user,
@@ -453,6 +482,7 @@ export namespace Agent {
         description: DESC_WEB_PROXY_AGENT.split("\n")[0].trim(),
         mode: "subagent",
         native: true,
+        steps: STEP_CAPS.orchestrator,
         // NOTE: proxy-agent runs on the FULL run model (no useSmallModel). Routing
         // is the brain of the pipeline — dispatch quality matters; downgrading it to
         // the small tier caused measured mis-/over-/under-dispatch. Only the analyzer
@@ -490,6 +520,7 @@ export namespace Agent {
         mode: "subagent",
         native: true,
         hidden: true,
+        steps: STEP_CAPS.analyzer,
         useSmallModel: true, // architecture extraction, not exploitation — run cheap
         prompt: PROMPT_PROXY_ANALYZER,
         prependRequestContext: true,
@@ -499,6 +530,7 @@ export namespace Agent {
             "*": "deny",
             bash: "allow",
             webfetch: "allow",
+            http_replay: "allow",
             web_get_session_context: "allow",
             web_get_detail: "allow",
             web_get_request_detail: "allow",
@@ -522,6 +554,7 @@ export namespace Agent {
           businessLogicAgent,
           ssrfAgent,
           fileAttacksAgent,
+          llmAgent,
         ] = await Promise.all([
           loadVulnAgent(PROMPT_PROXY_TESTER_IDOR, DESC_PROXY_TESTER_IDOR, ["wstg-authz-04", "wstg-apit-02"]),
           loadVulnAgent(PROMPT_PROXY_TESTER_AUTHZ, DESC_PROXY_TESTER_AUTHZ, [
@@ -558,14 +591,65 @@ export namespace Agent {
             "wstg-busl-08",
             "wstg-busl-09",
           ]),
+          loadVulnAgent(PROMPT_PROXY_TESTER_LLM, DESC_PROXY_TESTER_LLM, ["llm-security"]),
         ])
 
         const vulnAgentPermission = PermissionNext.merge(
           defaults,
           PermissionNext.fromConfig({
             "*": "deny",
-            bash: "allow",
-            webfetch: "allow",
+            bash: {
+              // Base: bash is allowed. The permission evaluator is ORDER-BASED
+              // (last matching rule wins, no specificity), so `*: allow` MUST come
+              // FIRST — the specific HTTP-client denies below then win over it for
+              // any command they match. (With `*: allow` last, findLast would pick
+              // it for every command and the denies would be inert.) Block HTTP
+              // clients so vuln testers funnel through http_replay — defense-in-depth
+              // with the prompt mandate. Effective by default, but a later `user`
+              // bash rule can still loosen them — unlike the destructive-SQL denies
+              // in injectionAgentPermission (merged after `user`, absolute). This is
+              // intentional: HTTP-client steering is a routing choice, not a
+              // destructive-command risk.
+              "*": "allow",
+              "*curl *": "deny",
+              "*curl.exe*": "deny",
+              "*wget *": "deny",
+              "*python*requests*": "deny",
+              "*python*urllib*": "deny",
+              "*python*aiohttp*": "deny",
+              "*python*httpx*": "deny",
+              "*python3*requests*": "deny",
+              "*python3*urllib*": "deny",
+              "*python3*aiohttp*": "deny",
+              "*python3*httpx*": "deny",
+              "*import requests*": "deny",
+              "*from requests *": "deny",
+              "*import urllib*": "deny",
+              "*import aiohttp*": "deny",
+              "*import httpx*": "deny",
+              // Block inline JS/TS execution — fetch() in bun/node/deno bypasses
+              // all Python/curl denies above.
+              "*bun -e*": "deny",
+              "*bun --eval*": "deny",
+              "*node -e*": "deny",
+              "*node --eval*": "deny",
+              "*deno eval*": "deny",
+              "*deno run *": "deny",
+              // Block raw TCP tools — can send HTTP without matching other patterns.
+              // `* nc *` catches piped/mid-command nc; `nc *` catches command-initial
+              // nc (the anchored matcher misses it otherwise) without hitting sync/ncat.
+              "* nc *": "deny",
+              "nc *": "deny",
+              "*ncat *": "deny",
+              "*socat *": "deny",
+              "*telnet *": "deny",
+              // Block base64-pipe-to-interpreter evasion pattern.
+              "*base64*| python*": "deny",
+              "*base64*| python3*": "deny",
+              "*base64*| bun*": "deny",
+              "*base64*| node*": "deny",
+            },
+            webfetch: "deny",
             web_get_session_context: "allow",
             web_get_detail: "allow",
             web_get_request_detail: "allow",
@@ -580,6 +664,13 @@ export namespace Agent {
             methodology_status: "allow",
             scope_check: "allow",
             attack_script: "allow",
+            skill: "allow",
+            // Structured replay engine — the ONLY way to send HTTP requests.
+            // Permission-enforced: curl/webfetch/Python HTTP denied above.
+            http_replay: "allow",
+            http_replay_raw: "allow",
+            web_update_credential: "allow",
+            csrf_extract: "allow",
           }),
           user,
         )
@@ -593,6 +684,9 @@ export namespace Agent {
         const injectionAgentPermission = PermissionNext.merge(
           vulnAgentPermission,
           PermissionNext.fromConfig({
+            // Injection-only: deterministic payload-battery / evidence tool. Scoped to
+            // this agent (not vulnAgentPermission) to keep the blast radius narrow.
+            inject_probe: "allow",
             bash: {
               // Destructive SQL DDL
               "*DROP TABLE*": "deny",
@@ -624,6 +718,26 @@ export namespace Agent {
               "*--reg-del*": "deny",
             },
           }),
+        )
+
+        // File-attacks-specific permission: inject_probe's LFI mode (read-only Linux/Windows
+        // path-traversal file-disclosure) hands this agent the WORKING filter-bypass shape. Scoped
+        // to this agent only (not vulnAgentPermission) to keep the blast radius narrow.
+        const fileAttacksPermission = PermissionNext.merge(
+          vulnAgentPermission,
+          PermissionNext.fromConfig({ inject_probe: "allow" }),
+        )
+
+        // LLM-specific permission: the LLM tester's instrument is `llmhook` (an
+        // automated OWASP LLM Top-10 scanner that posts crafted prompts to the
+        // captured chat endpoint). Scoped to this agent only (not
+        // vulnAgentPermission) to keep the blast radius narrow — no other vuln
+        // tester needs it. It does NOT get `hackbrowser`/`browser`: the endpoint
+        // is already captured in the prepended request context, so there is
+        // nothing to crawl.
+        const llmAgentPermission = PermissionNext.merge(
+          vulnAgentPermission,
+          PermissionNext.fromConfig({ llmhook: "allow" }),
         )
 
         return {
@@ -712,7 +826,18 @@ export namespace Agent {
             hidden: true,
             prompt: fileAttacksAgent.prompt,
             prependRequestContext: true,
-            permission: vulnAgentPermission,
+            permission: fileAttacksPermission,
+            options: {},
+          },
+          "proxy-tester-llm": {
+            name: "proxy-tester-llm",
+            description: llmAgent.description,
+            mode: "subagent" as const,
+            native: true,
+            hidden: true,
+            prompt: llmAgent.prompt,
+            prependRequestContext: true,
+            permission: llmAgentPermission,
             options: {},
           },
         }
@@ -775,7 +900,7 @@ export namespace Agent {
     // price). The cap is soft (forces a text wrap-up at the limit, prompt.ts) and only
     // applies when not explicitly configured, so user config still overrides.
     for (const name in result) {
-      if (result[name].steps == null && name.startsWith("proxy-tester-")) result[name].steps = 50
+      if (result[name].steps == null && name.startsWith("proxy-tester-")) result[name].steps = 60
     }
 
     return result

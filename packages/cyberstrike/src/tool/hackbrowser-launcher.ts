@@ -92,6 +92,9 @@ export interface LauncherOptions {
   credentials?: string[]
   steps?: number
   headless?: boolean
+  // Connect to user's real Chrome via CDP instead of Playwright's Chromium.
+  // Bypasses WAF TLS fingerprinting (Cloudflare, etc.).
+  cdp?: string
   // Soft signal — forwarded to worker as { type: "abort" } IPC message.
   // INTEGRATION.md §10.6.
   signal?: AbortSignal
@@ -147,8 +150,9 @@ async function prepareCrawl(opts: LauncherOptions): Promise<PreparedWorker> {
   // here so the error surfaces as a clean message instead.
   // Bun.resolve mirrors the worker's actual module lookup (upward traversal
   // from bin/ + NODE_PATH), so no false positives on non-standard installs.
+  let playwrightEntry: string
   try {
-    await Bun.resolve("playwright", Global.Path.bin)
+    playwrightEntry = await Bun.resolve("playwright", Global.Path.bin)
   } catch {
     throw new Error(
       `playwright is not installed. Run:\n` +
@@ -160,11 +164,15 @@ async function prepareCrawl(opts: LauncherOptions): Promise<PreparedWorker> {
   // 2c. Verify Chromium binary is installed. If missing, attempt automatic
   // installation via `npx playwright install chromium`. This avoids the common
   // UX issue where users install cyberstrike but don't know they need Chromium.
-  const playwrightDir = path.join(Global.Path.data, "node_modules", "playwright")
+  // Derive the playwright package dir from the RESOLVED entry (2b), not a
+  // hardcoded Global.Path.data path — with hoisted/non-standard installs the
+  // package lives elsewhere and the old assumption produced "Module not found
+  // .../node_modules/playwright/cli.js" while chromium was actually present.
+  const playwrightDir = path.dirname(playwrightEntry)
   try {
     const { execSync } = await import("child_process")
-    const checkScript = `require("${playwrightDir.replace(/\\/g, "/")}").chromium.executablePath()`
-    const chromiumPath = execSync(`${runtime} -e "process.stdout.write(${JSON.stringify(checkScript)})"`, {
+    const fullScript = `process.stdout.write(require(${JSON.stringify(playwrightDir.replace(/\\/g, "/"))}).chromium.executablePath())`
+    const chromiumPath = execSync(`${runtime} -e ${JSON.stringify(fullScript)}`, {
       encoding: "utf-8",
       timeout: 5000,
     }).trim()
@@ -243,6 +251,7 @@ async function prepareCrawl(opts: LauncherOptions): Promise<PreparedWorker> {
     cyberstrikeUrl,
     model: modelDescriptor,
     credentialDispatch,
+    cdp: opts.cdp,
   }
 
   return { workerOptions, modelInfo, workerPath, runtime }
@@ -417,7 +426,11 @@ async function backgroundRun(
     }
 
     // Worker exited without sending result/error — unexpected crash.
+    // Force-kill to clean up any orphaned Chrome child processes.
     if (!receivedResult) {
+      try {
+        proc.kill()
+      } catch {}
       const exitCode = await proc.exited.catch(() => -1)
       const stderr = await Bun.readableStreamToText(proc.stderr as ReadableStream).catch(() => "")
       const message =
@@ -459,7 +472,15 @@ async function backgroundRun(
     )
   } finally {
     activeRuns.delete(sessionID)
-    proc.kill()
+    try {
+      const s = proc.stdin
+      if (s && typeof s !== "number") (s as any).end()
+    } catch {}
+    setTimeout(() => {
+      try {
+        proc.kill()
+      } catch {}
+    }, 10_000)
   }
 }
 

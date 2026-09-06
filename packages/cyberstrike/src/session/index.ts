@@ -320,7 +320,7 @@ export namespace Session {
 
   export const share = fn(Identifier.schema("session"), async (id) => {
     const cfg = await Config.get()
-    if (cfg.share === "disabled") {
+    if (!cfg.share || cfg.share === "disabled") {
       throw new Error("Sharing is disabled in configuration")
     }
     const { ShareNext } = await import("@/share/share-next")
@@ -616,6 +616,13 @@ export namespace Session {
   export const remove = fn(Identifier.schema("session"), async (sessionID) => {
     const project = Instance.project
     try {
+      // Deleting a session is a genuine teardown — stop any background
+      // hackbrowser crawl it launched (turn-end no longer does this). Dynamic
+      // import avoids a session ↔ launcher import cycle; no-op if no active run.
+      const { stopHackbrowser } = await import("@/tool/hackbrowser-launcher")
+      try {
+        stopHackbrowser(sessionID)
+      } catch {}
       const session = await get(sessionID)
       for (const child of await children(sessionID)) {
         await remove(child.id)

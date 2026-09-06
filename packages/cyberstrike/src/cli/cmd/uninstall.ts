@@ -7,6 +7,7 @@ import { $ } from "bun"
 import fs from "fs/promises"
 import path from "path"
 import os from "os"
+import { Database as BunDatabase } from "bun:sqlite"
 
 interface UninstallArgs {
   keepConfig: boolean
@@ -15,8 +16,15 @@ interface UninstallArgs {
   force: boolean
 }
 
+interface RemovalTarget {
+  path: string
+  label: string
+  description: string
+  keep: boolean
+}
+
 interface RemovalTargets {
-  directories: Array<{ path: string; label: string; keep: boolean }>
+  directories: RemovalTarget[]
   shellConfig: string | null
   binary: string | null
 }
@@ -56,16 +64,62 @@ export const UninstallCommand = {
     UI.empty()
     prompts.intro("Uninstall CyberStrike")
 
+    // Check for other running cyberstrike instances
+    const running = await getRunningInstances()
+    if (running > 0) {
+      prompts.log.warn(`${running} other cyberstrike process${running > 1 ? "es" : ""} running`)
+      if (!args.force) {
+        const proceed = await prompts.confirm({
+          message: "Uninstalling while other instances are running may cause errors. Continue?",
+          initialValue: false,
+        })
+        if (!proceed || prompts.isCancel(proceed)) {
+          prompts.outro("Stop other cyberstrike processes first, then retry")
+          return
+        }
+      }
+    }
+
     const method = await Installation.method()
     prompts.log.info(`Installation method: ${method}`)
 
     const targets = await collectRemovalTargets(args, method)
 
+    // Interactive mode: let user pick what to remove
+    if (!args.force && !args.dryRun && process.stdout.isTTY) {
+      const existing = await getExistingTargets(targets)
+      if (existing.length > 0) {
+        const sizes = await Promise.all(existing.map((t) => getDirectorySize(t.path)))
+        const options = existing.map((t, i) => ({
+          value: t.path,
+          label: `${t.label} ${UI.Style.TEXT_DIM}(${formatSize(sizes[i])})`,
+          hint: t.description,
+        }))
+
+        const selected = await prompts.multiselect({
+          message: "What would you like to remove?",
+          options,
+          initialValues: existing.filter((t) => !t.keep).map((t) => t.path),
+          required: false,
+        })
+
+        if (prompts.isCancel(selected)) {
+          prompts.outro("Cancelled")
+          return
+        }
+
+        const selectedSet = new Set(selected)
+        for (const dir of targets.directories) {
+          dir.keep = !selectedSet.has(dir.path)
+        }
+      }
+    }
+
     await showRemovalSummary(targets, method)
 
     if (!args.force && !args.dryRun) {
       const confirm = await prompts.confirm({
-        message: "Are you sure you want to uninstall?",
+        message: "Proceed with uninstall?",
         initialValue: false,
       })
       if (!confirm || prompts.isCancel(confirm)) {
@@ -86,12 +140,67 @@ export const UninstallCommand = {
   },
 }
 
+async function getRunningInstances(): Promise<number> {
+  const pid = process.pid
+  try {
+    if (process.platform === "win32") {
+      const result = await $`tasklist /FI "IMAGENAME eq cyberstrike.exe" /FO CSV /NH`.quiet().nothrow()
+      const lines = result.stdout
+        .toString("utf8")
+        .split("\n")
+        .filter((l) => l.includes("cyberstrike"))
+      return Math.max(0, lines.length - 1)
+    }
+    const result = await $`pgrep -f cyberstrike`.quiet().nothrow()
+    const pids = result.stdout
+      .toString("utf8")
+      .trim()
+      .split("\n")
+      .filter((p) => p && Number(p) !== pid)
+    return pids.length
+  } catch {
+    return 0
+  }
+}
+
+async function getExistingTargets(targets: RemovalTargets): Promise<RemovalTarget[]> {
+  const result: RemovalTarget[] = []
+  for (const dir of targets.directories) {
+    const exists = await fs
+      .access(dir.path)
+      .then(() => true)
+      .catch(() => false)
+    if (exists) result.push(dir)
+  }
+  return result
+}
+
 async function collectRemovalTargets(args: UninstallArgs, method: Installation.Method): Promise<RemovalTargets> {
   const directories: RemovalTargets["directories"] = [
-    { path: Global.Path.data, label: "Data", keep: args.keepData },
-    { path: Global.Path.cache, label: "Cache", keep: false },
-    { path: Global.Path.config, label: "Config", keep: args.keepConfig },
-    { path: Global.Path.state, label: "State", keep: false },
+    {
+      path: Global.Path.data,
+      label: "Data",
+      description: "sessions, database, skills, snapshots",
+      keep: args.keepData,
+    },
+    {
+      path: Global.Path.cache,
+      label: "Cache",
+      description: "models cache, downloaded assets",
+      keep: false,
+    },
+    {
+      path: Global.Path.config,
+      label: "Config",
+      description: "cyberstrike.json, provider settings",
+      keep: args.keepConfig,
+    },
+    {
+      path: Global.Path.state,
+      label: "State",
+      description: "runtime state",
+      keep: false,
+    },
   ]
 
   const shellConfig = method === "curl" ? await getShellConfigFile() : null
@@ -101,7 +210,7 @@ async function collectRemovalTargets(args: UninstallArgs, method: Installation.M
 }
 
 async function showRemovalSummary(targets: RemovalTargets, method: Installation.Method) {
-  prompts.log.message("The following will be removed:")
+  prompts.log.message("Removal plan:")
 
   for (const dir of targets.directories) {
     const exists = await fs
@@ -112,7 +221,7 @@ async function showRemovalSummary(targets: RemovalTargets, method: Installation.
 
     const size = await getDirectorySize(dir.path)
     const sizeStr = formatSize(size)
-    const status = dir.keep ? UI.Style.TEXT_DIM + "(keeping)" : ""
+    const status = dir.keep ? UI.Style.TEXT_DIM + " (keeping)" : ""
     const prefix = dir.keep ? "○" : "✓"
 
     prompts.log.info(`  ${prefix} ${dir.label}: ${shortenPath(dir.path)} ${UI.Style.TEXT_DIM}(${sizeStr})${status}`)
@@ -144,9 +253,30 @@ async function executeUninstall(method: Installation.Method, targets: RemovalTar
   const spinner = prompts.spinner()
   const errors: string[] = []
 
+  // Checkpoint SQLite WAL before removing data directory
+  const dataTarget = targets.directories.find((d) => d.label === "Data")
+  if (dataTarget && !dataTarget.keep) {
+    const dbPath = path.join(dataTarget.path, "cyberstrike.db")
+    const dbExists = await fs
+      .access(dbPath)
+      .then(() => true)
+      .catch(() => false)
+    if (dbExists) {
+      spinner.start("Checkpointing database...")
+      try {
+        const sqlite = new BunDatabase(dbPath)
+        sqlite.run("PRAGMA wal_checkpoint(TRUNCATE)")
+        sqlite.close()
+        spinner.stop("Database checkpointed")
+      } catch {
+        spinner.stop("Database checkpoint skipped")
+      }
+    }
+  }
+
   for (const dir of targets.directories) {
     if (dir.keep) {
-      prompts.log.step(`Skipping ${dir.label} (--keep-${dir.label.toLowerCase()})`)
+      prompts.log.step(`Keeping ${dir.label}`)
       continue
     }
 
@@ -174,6 +304,22 @@ async function executeUninstall(method: Installation.Method, targets: RemovalTar
       errors.push(`Shell config: ${err.message}`)
     } else {
       spinner.stop("Cleaned shell config")
+    }
+  }
+
+  // Remove binary for curl installs
+  if (method === "curl" && targets.binary) {
+    spinner.start("Removing binary...")
+    const err = await fs.unlink(targets.binary).catch((e) => e)
+    if (err) {
+      spinner.stop("Could not remove binary", 1)
+      prompts.log.warn(`  Remove manually: rm "${targets.binary}"`)
+    } else {
+      spinner.stop(`Removed ${shortenPath(targets.binary)}`)
+      const binDir = path.dirname(targets.binary)
+      if (binDir.includes(".cyberstrike")) {
+        await fs.rmdir(binDir).catch(() => {})
+      }
     }
   }
 
@@ -211,17 +357,6 @@ async function executeUninstall(method: Installation.Method, targets: RemovalTar
     }
   }
 
-  if (method === "curl" && targets.binary) {
-    UI.empty()
-    prompts.log.message("To finish removing the binary, run:")
-    prompts.log.info(`  rm "${targets.binary}"`)
-
-    const binDir = path.dirname(targets.binary)
-    if (binDir.includes(".cyberstrike")) {
-      prompts.log.info(`  rmdir "${binDir}" 2>/dev/null`)
-    }
-  }
-
   if (errors.length > 0) {
     UI.empty()
     prompts.log.warn("Some operations failed:")
@@ -229,6 +364,13 @@ async function executeUninstall(method: Installation.Method, targets: RemovalTar
       prompts.log.error(`  ${err}`)
     }
   }
+
+  // Inform about per-project directories
+  UI.empty()
+  prompts.log.info(
+    `Per-project ${UI.Style.TEXT_NORMAL_BOLD}.cyberstrike/${UI.Style.TEXT_NORMAL} directories (skill cache, project config) are not removed.`,
+  )
+  prompts.log.info(`  To find them: ${UI.Style.TEXT_DIM}find ~ -name ".cyberstrike" -type d -maxdepth 5`)
 
   UI.empty()
   prompts.log.success("Thank you for using CyberStrike!")

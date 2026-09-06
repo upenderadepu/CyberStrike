@@ -15,10 +15,12 @@
 import { createAnthropic } from "@ai-sdk/anthropic"
 import type { LanguageModel } from "ai"
 import { BUNDLED_PROVIDERS } from "../provider/bundled-providers"
+import { exchangeCopilotToken, invalidateCopilotToken, copilotApiBase, copilotHeaders } from "../provider/copilot-session"
 import { runCrawl } from "@cyberstrike-io/hackbrowser/api"
 import type { CrawlOptions, LogRecord, CSEvent } from "@cyberstrike-io/hackbrowser/api"
 import type { ParentMessage, WorkerMessage, WorkerOptions, ModelDescriptor } from "./worker-ipc"
 import readline from "readline"
+import tls from "node:tls"
 
 // ============================================================
 // IPC helpers
@@ -26,6 +28,63 @@ import readline from "readline"
 
 function send(msg: WorkerMessage): void {
   process.stdout.write(JSON.stringify(msg) + "\n")
+}
+
+// ============================================================
+// Crash safety net (#117)
+// ============================================================
+//
+// The worker does extensive async DOM work (page.evaluate, selectors, network
+// capture, event handlers). A single uncaught throw anywhere would otherwise
+// terminate the process and kill the whole multi-page crawl — one bad element
+// must never abort a 50-page run (#116). Captured requests are ingested to the
+// parent live, so continuing loses no data, and the BFS loop has its own
+// per-page try/catch + browser-death detection to terminate on real failure.
+const UNCAUGHT_LIMIT = 25
+const UNCAUGHT_WINDOW_MS = 15_000
+let uncaughtTimes: number[] = []
+
+function stringifyError(e: unknown): string {
+  if (e instanceof Error) return (e.stack ?? e.message).slice(0, 500)
+  try {
+    return String(e).slice(0, 500)
+  } catch {
+    return "<unstringifiable>"
+  }
+}
+
+function installCrashGuards(): void {
+  // An unhandledRejection escaped EVERY await, so the main runCrawl chain never
+  // depended on it (a fire-and-forget background promise). Log and continue.
+  process.on("unhandledRejection", (reason) => {
+    send({
+      type: "log",
+      level: "warn",
+      service: "hackbrowser:worker",
+      message: "unhandledRejection (crawl continues): " + stringifyError(reason),
+    })
+  })
+  // uncaughtException is a sync throw in a callback (event handler/timer) with
+  // no try/catch — usually background too. Continue, but bail if they flood:
+  // a genuinely corrupted browser/session, so stop rather than spin forever.
+  process.on("uncaughtException", (err) => {
+    send({
+      type: "log",
+      level: "error",
+      service: "hackbrowser:worker",
+      message: "uncaughtException (crawl continues): " + stringifyError(err),
+    })
+    const now = Date.now()
+    uncaughtTimes.push(now)
+    uncaughtTimes = uncaughtTimes.filter((t) => now - t < UNCAUGHT_WINDOW_MS)
+    if (uncaughtTimes.length > UNCAUGHT_LIMIT) {
+      send({
+        type: "error",
+        message: `worker aborted after ${uncaughtTimes.length} uncaught exceptions in ${UNCAUGHT_WINDOW_MS / 1000}s — likely a corrupted browser/session`,
+      })
+      process.exit(1)
+    }
+  })
 }
 
 // ============================================================
@@ -84,6 +143,16 @@ function applyAnthropicBearerBody(
   }
 }
 
+// Mirror of provider.ts's shouldUseCopilotResponsesApi / isGpt5OrLater. Kept local rather than
+// imported because this worker is a standalone bundle that must not pull in the heavy provider
+// module. GPT-5+ Copilot models are served on the Responses API, not Chat Completions; gpt-5-mini
+// stays on Chat Completions. modelApiId is hyphenated (e.g. "gpt-5-4"), which /^gpt-(\d+)/ still
+// matches on the leading major version.
+function shouldUseCopilotResponsesApi(modelID: string): boolean {
+  const match = /^gpt-(\d+)/.exec(modelID)
+  return match !== null && Number(match[1]) >= 5 && !modelID.startsWith("gpt-5-mini")
+}
+
 function createModelFromDescriptor(desc: ModelDescriptor): LanguageModel {
   const stripSampling = desc.supportsTemperature === false
 
@@ -128,33 +197,52 @@ function createModelFromDescriptor(desc: ModelDescriptor): LanguageModel {
     return createAnthropic(opts as Parameters<typeof createAnthropic>[0])(desc.modelApiId)
   }
 
-  // GitHub Copilot OAuth: same pattern as Anthropic above.
-  // Swap default auth for Bearer token and add Copilot-specific headers.
+  // GitHub Copilot OAuth: same pattern as Anthropic above, but the raw ghu_
+  // token is NOT accepted by api.githubcopilot.com (403 "Forbidden"). Exchange
+  // it for a short-lived Copilot session token and send the integration/editor
+  // headers Copilot validates. Shared with the main chat provider via
+  // copilot-session.ts so the two can't drift again (#107).
   if (desc.npm.includes("github-copilot") && desc.copilotToken) {
-    const token = desc.copilotToken
+    const githubToken = desc.copilotToken
+    const exchangeBase = copilotApiBase(desc.copilotEnterpriseDomain)
     const factory = BUNDLED_PROVIDERS[desc.npm]
     if (!factory) throw new Error(`hackbrowser: missing bundled provider "${desc.npm}"`)
     const opts: Record<string, unknown> = {
       apiKey: "placeholder",
-      fetch: (url: any, init?: any) => {
-        const headers = new Headers(init?.headers)
-        headers.delete("x-api-key")
-        headers.delete("authorization")
-        headers.set("Authorization", `Bearer ${token}`)
-        headers.set("x-initiator", "user")
-        headers.set("User-Agent", `cyberstrike/${CYBERSTRIKE_VERSION}`)
-        headers.set("Openai-Intent", "conversation-edits")
-        return fetch(url, {
-          ...init,
-          headers,
-          body: stripSampling ? stripSamplingParams(init?.body) : init?.body,
-        })
+      fetch: async (url: any, init?: any) => {
+        const body = stripSampling ? stripSamplingParams(init?.body) : init?.body
+        const send = (sessionToken: string) => {
+          const headers = new Headers(init?.headers)
+          headers.delete("x-api-key")
+          headers.delete("authorization")
+          headers.set("x-initiator", "user")
+          for (const [key, value] of Object.entries(copilotHeaders(sessionToken))) headers.set(key, value)
+          return fetch(url, { ...init, headers, body })
+        }
+
+        let response = await send(await exchangeCopilotToken(githubToken, exchangeBase))
+        // A 403 under heavy use is usually a rotated/expired session token, not a
+        // real auth failure. Force a fresh exchange and retry once before the
+        // error surfaces as a stalled crawl.
+        if (response.status === 403) {
+          invalidateCopilotToken(githubToken)
+          response = await send(await exchangeCopilotToken(githubToken, exchangeBase))
+        }
+        return response
       },
     }
     if (desc.baseURL) opts.baseURL = desc.baseURL
     if (desc.headers) opts.headers = desc.headers
     const sdk = factory(opts) as any
-    return sdk.languageModel(desc.modelApiId)
+    // GPT-5+ Copilot models are only served on the Responses API; the main process routes them
+    // there (provider.ts shouldUseCopilotResponsesApi). The worker used sdk.languageModel — which
+    // the Copilot SDK maps to the Chat Completions endpoint (copilot-provider.ts) — for every
+    // model, so GPT-5 planner calls hit the wrong endpoint and every plan failed. Mirror the main
+    // process. For non-GPT-5 models sdk.chat === the old sdk.languageModel, so they are unchanged.
+    if (sdk.responses === undefined && sdk.chat === undefined) return sdk.languageModel(desc.modelApiId)
+    return shouldUseCopilotResponsesApi(desc.modelApiId)
+      ? sdk.responses(desc.modelApiId)
+      : sdk.chat(desc.modelApiId)
   }
 
   // Every other provider: resolve the SDK factory from the SHARED provider map
@@ -225,6 +313,7 @@ function buildCrawlOptions(opts: WorkerOptions, signal: AbortSignal): CrawlOptio
     panel: opts.panel,
     cyberstrikeUrl: opts.cyberstrikeUrl,
     model,
+    cdp: opts.cdp,
     logSink,
     eventSink,
     signal,
@@ -236,7 +325,33 @@ function buildCrawlOptions(opts: WorkerOptions, signal: AbortSignal): CrawlOptio
 // Main
 // ============================================================
 
+// The crawler worker runs as a separate Node (or bun) subprocess and makes its own TLS
+// connection to the LLM API — unlike the main process, whose Bun runtime already trusts the OS
+// certificate store. Node trusts only its bundled CA list, so when a corporate proxy / VPN /
+// antivirus intercepts TLS (presenting a root CA the OS trusts but Node's bundle does not), the
+// worker's LLM call fails with UNABLE_TO_GET_ISSUER_CERT_LOCALLY while the main-process chat with
+// the same token works. Merge the OS trust store into the default CA set — the same thing that
+// `node --use-system-ca` does, done here in-process. It only ADDS trust (the bundled defaults are
+// kept), so it cannot break a connection that already verifies; on runtimes without these APIs
+// (bun, Node < 22.15) it is a graceful no-op.
+function trustSystemCertificates(): void {
+  try {
+    const t = tls as unknown as {
+      getCACertificates?: (type: "default" | "system") => string[]
+      setDefaultCACertificates?: (certs: readonly string[]) => void
+    }
+    if (typeof t.getCACertificates !== "function" || typeof t.setDefaultCACertificates !== "function") return
+    const system = t.getCACertificates("system")
+    if (system.length === 0) return
+    t.setDefaultCACertificates([...t.getCACertificates("default"), ...system])
+  } catch {
+    // Best-effort: leave the default trust store unchanged if anything is unavailable.
+  }
+}
+
 async function main(): Promise<void> {
+  installCrashGuards()
+  trustSystemCertificates()
   const controller = new AbortController()
 
   const rl = readline.createInterface({ input: process.stdin, terminal: false })
@@ -268,8 +383,16 @@ async function main(): Promise<void> {
     }
   })
 
-  // Wait until stdin closes (parent terminates or closes the pipe)
-  await new Promise<void>((resolve) => rl.once("close", resolve))
+  // Wait until stdin closes (parent terminates or closes the pipe).
+  // Abort the crawl so run()'s disconnect-wait breaks and the worker exits cleanly.
+  await new Promise<void>((resolve) =>
+    rl.once("close", () => {
+      controller.abort()
+      resolve()
+    }),
+  )
+  // Backstop: if runWorker is still hanging 5s after stdin close, force exit
+  setTimeout(() => process.exit(0), 5000).unref()
 }
 
 async function runWorker(opts: WorkerOptions, signal: AbortSignal): Promise<void> {
